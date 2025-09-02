@@ -1,0 +1,305 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(CMAverse)
+library(ggplot2)
+library(dplyr)
+library(scales)
+```
+
+
+
+
+```{r}
+# --- Data Generating Process ---
+logistic <- function(x, beta) {
+  return(1 / (1 + exp(-beta * x)))
+}
+
+mediation.df <- function(n=10000) {
+  Z <- rnorm(n, mean = 0, sd = 1)
+  p_X <- 1 / (1 + exp(- (0.5)))
+  X <- rbinom(n, 1, p_X)
+  M <- 1.0 * X + 1.0 * Z + rnorm(n)
+  Y <- 0.5 * X + 1.0 * M + 2.0 * M * X + 0.5 * Z + rnorm(n) 
+  df <- data.frame(Z, X, M, Y)
+  return(df)
+}
+
+
+mediation.all.confounded.df <- function(n=10000) {
+  Z <- rnorm(n, mean = 0, sd = 1)
+  p_X <- 1 / (1 + exp(-Z))
+  X <- rbinom(n, 1, p_X)
+  M <- 1.0 * X + 1.0 * Z + rnorm(n)
+  Y <- 0.5 * X + 1.0 * M + 2.0 * M * X + 2.0 * Z + rnorm(n)
+  df <- data.frame(Z, X, M, Y)
+  return(df)
+}
+
+mediation.exposure.outcome.df <- function(n=10000) {
+  Z <- rnorm(n, mean = 0, sd = 1)
+  p_X <- 1 / (1 + exp(-Z))
+  X <- rbinom(n, 1, p_X)
+  M <- 1.0 * X + rnorm(n)
+  Y <- 0.5 * X + 1.0 * M + 0. * M * X + 0.5 * Z + rnorm(n)
+  df <- data.frame(Z, X, M, Y)
+  return(df)
+}
+
+
+# --- Simulation Parameters ---
+n.iter <- 100 
+n.sim_data <- 10000
+n.fixed <- 1000
+confounding_betas <- seq(0, 2, by = 0.2) # Range of beta values for selection bias
+
+# True NIE/NDE values (from your problem description)
+true_nde <- 0.5 # The original problem description states this should be 1.5,
+               # but the "New method" code comment says 0.5. I'll use 0.5 for consistency with the new method's expectation.
+true_nie <- 3
+
+# --- Data storage ---
+results_df <- data.frame()
+
+```
+
+
+
+# Sample/Resample Version
+
+```{r}
+# --- Simulation Loop ---
+for (beta_val in confounding_betas) {
+  print(paste("Running simulations for beta =", beta_val))
+
+  # Initialize lists for current beta_val
+  biased_ndes <- c()
+  biased_nies <- c()
+  adjusted_ndes <- c()
+  adjusted_nies <- c()
+
+  for(i in 1:n.iter) {
+    df <- mediation.df(n=n.sim_data)
+
+    # Introduce selection bias (same for both methods in this iteration)
+    probabilities <- logistic(df$Z, beta = beta_val)
+    random_values <- runif(nrow(df))
+    selected <- probabilities > random_values
+    df.s <- df[selected, ]
+    df.s <- df.s[sample(nrow(df.s), n.fixed), ]
+    
+
+    # --- Biased method ---
+    # For mediation.df: X is 1 exposure, M is 1 mediator
+    elevel <- 2 # X (exposure) + intercept
+    mlevel <- 2 # M (mediator) + intercept
+
+    new.m_biased <- glm(formula = M ~ X + Z, family = gaussian, data = df.s)
+    new.y_biased <- glm(formula = Y ~ X + M + X * M + Z, family = gaussian, data = df.s)
+
+    thetas_biased <- coef(new.y_biased)
+    betas_biased <- as.vector(t(coef(new.m_biased))) ## why t
+
+    theta0_biased <- thetas_biased[1] # int
+    theta1_biased <- thetas_biased[2:(elevel)] # X
+    theta2_biased <- thetas_biased[(elevel+1):(elevel + mlevel -1)] # M
+    theta3_biased <- thetas_biased[5] # X * M
+    beta0_biased <- betas_biased[1] # int
+    beta1_biased <- betas_biased[2] # X
+
+    vecc_biased <- mean(df.s$Z) # E[Z | S=1]
+    covariatesTerm_biased <- betas_biased[3] * vecc_biased # Z * E[vecc]
+
+    # Assuming 'a' and 'astar' are defined for counterfactuals
+    # Common choices are a=1, astar=0 for binary exposure
+    a <- 1
+    astar <- 0
+
+    pnde_biased <- sum(theta1_biased * a) - sum(theta1_biased * astar) + (sum(theta3_biased * a) - sum(theta3_biased * astar)) * (beta0_biased + sum(beta1_biased * astar) + covariatesTerm_biased)
+    tnie_biased <- (theta2_biased + sum(theta3_biased * a)) * (sum(beta1_biased * a) - sum(beta1_biased * astar))
+    tnie_biased <- tnie_biased[[1]]
+
+    biased_ndes <- c(biased_ndes, pnde_biased)
+    biased_nies <- c(biased_nies, tnie_biased)
+
+    # --- New method (adjusted) ---
+    prob.s <- length(df.s$Z) / ( length(df$Z) )
+    external.df <- data.frame(Z = df$Z, S = selected * 1.)
+    # Added suppressWarnings because glm(S ~ Z + 0, ...) can sometimes warn about all S being 0 or 1.
+    logistic_model <- suppressWarnings(glm(S ~ Z, data = external.df, family = binomial()))
+    pred_prob <- predict(logistic_model, newdata = df.s, type = "response")
+    w <- prob.s / pred_prob
+
+    # Handle cases where w might be Inf or NaN due to pred_prob being 0
+    w[is.infinite(w) | is.nan(w)] <- 0 # or some other robust handling
+
+    new.m_adjusted <- glm(formula = M ~ X + Z, family = gaussian, data = df.s, weights = w)
+    new.y_adjusted <- glm(formula = Y ~ X + M + X * M + Z, family = gaussian, data = df.s, weights = w)
+
+    thetas_adjusted <- coef(new.y_adjusted)
+    betas_adjusted <- as.vector(t(coef(new.m_adjusted)))
+
+    theta0_adjusted <- thetas_adjusted[1]
+    theta1_adjusted <- thetas_adjusted[2:(elevel)]
+    theta2_adjusted <- thetas_adjusted[(elevel+1):(elevel + mlevel -1)]
+    theta3_adjusted <- thetas_adjusted[5]
+    beta0_adjusted <- betas_adjusted[1]
+    beta1_adjusted <- betas_adjusted[2]
+
+    # Note: vecc in new method uses weighted mean
+    vecc_adjusted <- sum(df.s$Z * w) / sum(w) # Correct weighted mean calculation
+    covariatesTerm_adjusted <- betas_adjusted[3] * vecc_adjusted
+
+    pnde_adjusted <- sum(theta1_adjusted * a) - sum(theta1_adjusted * astar) + (sum(theta3_adjusted * a) - sum(theta3_adjusted * astar)) * (beta0_adjusted + sum(beta1_adjusted * astar) + covariatesTerm_adjusted)
+    tnie_adjusted <- (theta2_adjusted + sum(theta3_adjusted * a)) * (sum(beta1_adjusted * a) - sum(beta1_adjusted * astar))
+    tnie_adjusted <- tnie_adjusted[[1]]
+
+    adjusted_ndes <- c(adjusted_ndes, pnde_adjusted)
+    adjusted_nies <- c(adjusted_nies, tnie_adjusted)
+  }
+
+  # Store results for current beta_val, now with 95% Confidence Intervals
+  results_df <- rbind(results_df,
+                      data.frame(
+                        Confounding = beta_val,
+                        Method = "Biased",
+                        Effect = "NDE",
+                        Mean = mean(biased_ndes, na.rm = TRUE),
+                        CI_Lower = quantile(biased_ndes, probs = 0.025, na.rm = TRUE),
+                        CI_Upper = quantile(biased_ndes, probs = 0.975, na.rm = TRUE)
+                      ),
+                      data.frame(
+                        Confounding = beta_val,
+                        Method = "Biased",
+                        Effect = "NIE",
+                        Mean = mean(biased_nies, na.rm = TRUE),
+                        CI_Lower = quantile(biased_nies, probs = 0.025, na.rm = TRUE),
+                        CI_Upper = quantile(biased_nies, probs = 0.975, na.rm = TRUE)
+                      ),
+                      data.frame(
+                        Confounding = beta_val,
+                        Method = "Adjusted",
+                        Effect = "NDE",
+                        Mean = mean(adjusted_ndes, na.rm = TRUE),
+                        CI_Lower = quantile(adjusted_ndes, probs = 0.025, na.rm = TRUE),
+                        CI_Upper = quantile(adjusted_ndes, probs = 0.975, na.rm = TRUE)
+                      ),
+                      data.frame(
+                        Confounding = beta_val,
+                        Method = "Adjusted",
+                        Effect = "NIE",
+                        Mean = mean(adjusted_nies, na.rm = TRUE),
+                        CI_Lower = quantile(adjusted_nies, probs = 0.025, na.rm = TRUE),
+                        CI_Upper = quantile(adjusted_nies, probs = 0.975, na.rm = TRUE)
+                      )
+  )
+}
+```
+
+```{r}
+# --- Filter Data ---
+plot_data_filtered <- results_df %>% 
+  filter(!is.na(Mean) & !is.na(CI_Lower) & !is.na(CI_Upper))
+
+# Relabel the 'Method' variable
+plot_data_filtered$Method <- factor(plot_data_filtered$Method,
+                                    levels = c("Biased", "Adjusted"),
+                                    labels = c("Naive", "Selection Adjusted"))
+
+table(plot_data_filtered$Method)
+
+# Get unique Confounding values and Effects
+confounding_vals <- unique(plot_data_filtered$Confounding)
+
+# Create True rows for NDE and NIE
+true_rows <- expand.grid(
+  Confounding = confounding_vals,
+  Effect = c("NDE", "NIE")
+) %>%
+  mutate(
+    Method = "True",
+    Mean = ifelse(Effect == "NDE", 0.5, 3),
+    CI_Lower = NA,
+    CI_Upper = NA
+  )
+
+# Combine with original data
+plot_data_augmented <- bind_rows(plot_data_filtered, true_rows)
+plot_data_augmented
+```
+
+
+
+
+```{r}
+plot_data_augmented$Method <- factor(plot_data_augmented$Method,
+                                     levels = c("Naive", "Selection Adjusted", "True"))
+
+# Calculate true values for centering
+true_nde <- unique(plot_data_augmented$Mean[plot_data_augmented$Effect == "NDE" & plot_data_augmented$Method == "True"])
+true_nie <- unique(plot_data_augmented$Mean[plot_data_augmented$Effect == "NIE" & plot_data_augmented$Method == "True"])
+
+# Calculate range for centering
+range_buffer <- 1.5  # Adjust this to make the range wider/narrower
+
+# Plot with custom y-limits for each facet
+p <- ggplot(plot_data_augmented, aes(x = Confounding, y = Mean, color = Method, group = Method)) +
+  geom_line(data = plot_data_augmented %>% filter(Method != "True"), size = 1) +
+  geom_line(data = plot_data_augmented %>% filter(Method == "True"), size = 2.5, linetype = "dotted") +
+  geom_ribbon(
+    data = plot_data_augmented %>% filter(Method != "True"),
+    aes(ymin = CI_Lower, ymax = CI_Upper, fill = Method), alpha = 0.2, color = NA
+  ) +
+  # Add invisible points to set y-axis limits
+  geom_blank(data = data.frame(
+    Effect = c("NDE", "NDE", "NIE", "NIE"), 
+    Mean = c(true_nde - range_buffer, true_nde + range_buffer, 
+             true_nie - range_buffer, true_nie + range_buffer), 
+    Confounding = 0,
+    Method = "True"  # Add required aesthetic
+  )) +
+  facet_wrap(~ Effect, ncol = 1, scales = "free_y") +
+  labs(
+    y = "Estimated Effect (Mean & 95% CI)",
+    x = expression(Selection~Bias~Strength~beta[S]),
+    color = "Method"
+  ) +
+  scale_color_manual(values = c("Naive" = "red", "Selection Adjusted" = "blue", "True" = "black")) +
+  scale_fill_manual(values = c("Naive" = "red", "Selection Adjusted" = "blue")) +
+  coord_cartesian(xlim = c(0, 2), clip = "off") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 18, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.text = element_text(size = 20),
+    axis.title = element_text(size = 22),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 22)
+  ) + 
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linetype = c("solid", "solid", "dotted"),
+        size = c(1, 1, 1.2)
+      )
+    ),
+    fill = "none"
+  )
+
+# Show plot
+p
+```
+
+```{r}
+ggsave("mediation_comparison.pdf", plot = p, width = 10, height = 8, dpi=300)
+```
+
+
+
+
+

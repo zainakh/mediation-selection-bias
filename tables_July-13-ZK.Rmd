@@ -1,0 +1,98 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(MASS)  
+library(dplyr)
+library(tableone)
+```
+
+```{r}
+# --- Define Inputs for the Mediation Function ---
+outcome_variable <- "listed"
+exposure_variable <- "has_private_insurance"
+mediator_variable <- "psychosocial"
+
+# Confounders used in the simulation's generating models
+confounder_variables <- c("age", "sex", "ADI_NATRANK", "race_ethnicity")
+
+# Interaction terms used in the simulation's generating models
+# These are interactions between BASE confounders
+# The function will construct e.g. "age:race_ethnicity" from this
+base_interaction_vars <- c("age:race_ethnicity", "ADI_NATRANK:race_ethnicity")
+```
+
+```{r}
+# Read in data
+total.df <- read.csv("referral_2016_2017_20250411.csv", na.strings = c("", "NA")) 
+
+# Merge categories for stability
+total.df$race_ethnicity <- as.character(total.df$race_ethnicity)
+total.df$race_ethnicity[total.df$race_ethnicity %in% c("Hispanic", "Other")] <- "Hispanic/Other"
+total.df$race_ethnicity <- factor(total.df$race_ethnicity,
+                              levels = c("Non-hispanic white", "Non-hispanic black", "Hispanic/Other"))
+
+# Split into encounters and referred populations
+df <- total.df[!is.na(total.df[mediator]), ] 
+external.df <- total.df[is.na(total.df[mediator]), ]
+
+# Remove NAs in df
+cols_of_interest <- c(outcome_variable, exposure_variable, mediator_variable, confounder_variables)
+df.subset <- df[, cols_of_interest] 
+complete_rows <- complete.cases(df.subset) 
+df <- df[complete_rows, ] 
+
+external.df.subset <- external.df[, confounder_variables]
+complete_rows.external <- complete.cases(external.df.subset)
+external.df <- external.df[complete_rows.external, ]
+
+df$S <- 1.
+external.df$S <- 0.
+total.df <- dplyr::bind_rows(df,external.df)
+
+prob.s <- nrow(df) / nrow(total.df)
+
+df
+external.df
+```
+
+```{r}
+# Table 2: Evaluated not stratified 
+categorical.vars <- c("sex", "race_ethnicity", exposure_variable, outcome_variable) 
+all_variables <- c(exposure_variable, mediator_variable, confounder_variables, outcome_variable)
+tab <- CreateTableOne(vars = all_variables, data = df, factorVars = categorical.vars)
+
+sink("tabletwo_total.txt")  
+print(tab, nonnormal = TRUE, formatOptions = list(big.mark = ","))
+sink()  
+```
+
+```{r}
+# Table 2: Evaluated and stratified 
+tab <- CreateTableOne(vars = all_variables, strata = outcome_variable, data = df, factorVars = categorical.vars)
+
+sink("tabletwo_stratified.txt")  
+print(tab, nonnormal = TRUE, formatOptions = list(big.mark = ","))
+sink()  
+```
+
+```{r}
+# Table 1: Dropout population 
+categorical.vars.external <- c("sex", "race_ethnicity") 
+external.tab <- CreateTableOne(vars = c(confounder_variables, 'S'), data = total.df, factorVars = c(categorical.vars.external, 'S'))
+sink("tableone_total.txt")  
+print(external.tab, nonnormal = TRUE, formatOptions = list(big.mark = ","))
+sink() 
+```
+
+```{r}
+# Table 2: Evaluated and stratified 
+tab <- CreateTableOne(vars = confounder_variables, strata = 'S', data = total.df, factorVars = categorical.vars.external)
+
+sink("tableone_stratified.txt")  
+print(tab, nonnormal = TRUE, formatOptions = list(big.mark = ","))
+sink()  
+```

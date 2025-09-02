@@ -1,0 +1,596 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+install.packages("tableone")
+install.packages("MASS") 
+devtools::install_github("BS1125/CMAverse") 
+```
+
+```{r}
+library(dplyr)
+library(CMAverse)
+library(MASS)  
+library(dplyr)
+library(tableone)
+library(boot)  
+```
+
+```{r}
+# --- Define Inputs for the Mediation Function ---
+outcome_variable <- "listed"
+exposure_variable <- "has_private_insurance"
+mediator_variable <- "psychosocial"
+
+# Confounders used in the simulation's generating models
+confounder_variables <- c("age", "sex", "ADI_NATRANK", "race_ethnicity")
+
+# Interaction terms used in the simulation's generating models
+# These are interactions between BASE confounders
+# The function will construct e.g. "age:race_ethnicity" from this
+base_interaction_vars <- c("age:race_ethnicity", "ADI_NATRANK:race_ethnicity")
+```
+
+```{r}
+# Read in data
+total.df <- read.csv("referral_2016_2017_20250411.csv", na.strings = c("", "NA"))   # TODO: Check that the right file is being read in
+
+# Merge categories for stability
+total.df$race_ethnicity <- as.character(total.df$race_ethnicity)
+total.df$race_ethnicity[total.df$race_ethnicity %in% c("Hispanic", "Other")] <- "Hispanic/Other"
+total.df$race_ethnicity <- factor(total.df$race_ethnicity,
+                              levels = c("Non-hispanic white", "Non-hispanic black", "Hispanic/Other"))
+
+# Split into encounters and referred populations
+df <- total.df[!is.na(total.df[mediator]), ] 
+external.df <- total.df[is.na(total.df[mediator]), ]
+
+
+# Remove NAs in df
+cols_of_interest <- c(outcome_variable, exposure_variable, mediator_variable, confounder_variables)
+df.subset <- df[, cols_of_interest] 
+complete_rows <- complete.cases(df.subset) 
+df <- df[complete_rows, ] 
+
+external.df.subset <- external.df[, confounder_variables]
+complete_rows.external <- complete.cases(external.df.subset)
+external.df <- external.df[complete_rows.external, ]
+
+df$S <- 1.
+external.df$S <- 0.
+total.df <- dplyr::bind_rows(df,external.df)
+
+prob.s <- nrow(df) / nrow(total.df)
+
+df
+external.df
+```
+
+
+```{r}
+# Selection regression 
+selection_formula <- as.formula(paste("S ~", paste(c(confounder_variables, base_interaction_vars), collapse = " + ")))
+logistic_model <- glm(selection_formula, data = total.df, family = binomial())
+
+sink("selection-regression.txt")
+summary(logistic_model)
+sink()
+```
+
+```{r}
+# Selection weights plot
+pred_prob <- predict(logistic_model, newdata = df, type = "response")
+w <- prob.s / pred_prob
+
+png("weight-hist.png", width = 800, height = 600)
+hist(w)
+dev.off()
+```
+
+
+```{r}
+run_mediation_analysis <- function(data,
+                                   outcome_name,
+                                   exposure_name,
+                                   mediator_name,
+                                   confounder_names,
+                                   base_interaction_names = NULL, # e.g., c("race_ethnicity:age")
+                                   indices = NULL) {
+
+  # --- 1. Data Preparation & Bootstrapping ---
+  if (!is.null(indices)) {
+    data_analysis <- data[indices, ]
+  } else {
+    data_analysis <- data
+  }
+  n_obs <- nrow(data_analysis)
+
+  # Ensure exposure and mediator are factors for model fitting if they are binary/categorical
+  # This is crucial for how glm sets up contrasts and for predict() later.
+  # The counterfactual values for exposure will also be factors.
+  # The mediator, when used as a predictor in the outcome model with its probability, will be numeric.
+  if (!is.factor(data_analysis[[exposure_name]])) {
+    data_analysis[[exposure_name]] <- factor(data_analysis[[exposure_name]])
+  }
+  if (!is.factor(data_analysis[[mediator_name]])) {
+    # Assuming mediator is binary 0/1 if not already a factor for the initial model fit
+    data_analysis[[mediator_name]] <- factor(data_analysis[[mediator_name]])
+  }
+   if (!is.factor(data_analysis[[outcome_name]])) {
+    # Assuming outcome is binary 0/1 if not already a factor
+    data_analysis[[outcome_name]] <- factor(data_analysis[[outcome_name]])
+  }
+
+
+  exposure_levels <- levels(data_analysis[[exposure_name]])
+  if (length(exposure_levels) != 2) {
+    stop(paste("Exposure variable '", exposure_name, "' must be binary (have 2 levels). Found: ",
+               paste(exposure_levels, collapse=", ")))
+  }
+  # Define exposed (a) and unexposed (astar) levels
+  # Typically, the second level is considered 'exposed' or 'treatment'
+  astar <- exposure_levels[1] # Control/Unexposed level
+  a <- exposure_levels[2]     # Treatment/Exposed level
+
+  # --- 2. Define Formulas ---
+  # Mediator model formula
+  mediator_formula_rhs <- paste(exposure_name, "+", paste(c(confounder_names, base_interaction_names), collapse = " + "))
+  mediator_formula <- as.formula(paste(mediator_name, "~", mediator_formula_rhs))
+
+  # Outcome model formula (with exposure-mediator interaction)
+  outcome_formula_rhs <- paste(
+    exposure_name, "+",
+    mediator_name, "+",
+    paste0(exposure_name, ":", mediator_name), "+",
+    paste(c(confounder_names, base_interaction_names), collapse = " + ")
+  )
+  outcome_formula <- as.formula(paste(outcome_name, "~", outcome_formula_rhs))
+
+  # --- 3. Fit Regression Models ---
+  # Mediator model (M ~ A + C)
+  reg.m <- glm(formula = mediator_formula, family = binomial(), data = data_analysis)
+  
+  # Outcome model (Y ~ A + M + A*M + C)
+  reg.y <- glm(formula = outcome_formula, family = binomial(), data = data_analysis)
+
+  # --- 4. Counterfactual Predictions for Mediator ---
+  # Create counterfactual datasets for predicting mediator
+  # All subjects if they had exposure = a
+  newdata_med_a <- data_analysis
+  newdata_med_a[[exposure_name]] <- factor(rep(a, n_obs), levels = exposure_levels)
+
+  # All subjects if they had exposure = astar
+  newdata_med_astar <- data_analysis
+  newdata_med_astar[[exposure_name]] <- factor(rep(astar, n_obs), levels = exposure_levels)
+
+  # Predict P(M=1 | A=a, C) and P(M=1 | A=astar, C)
+  # These are E[M | A=a, C] and E[M | A=astar, C] as M is binary
+  prob_m_given_a <- predict(reg.m, newdata = newdata_med_a, type = "response")
+  prob_m_given_astar <- predict(reg.m, newdata = newdata_med_astar, type = "response")
+
+  #print(summary(prob_m_given_a))
+  #print(summary(prob_m_given_astar))
+  # --- 5. Counterfactual Predictions for Outcome ---
+  
+  # Get levels of the mediator factor (e.g., "0" and "1")
+  mediator_levels <- levels(data_analysis[[mediator_name]])
+  if (length(mediator_levels) != 2) {
+    stop(paste("Mediator variable '", mediator_name, "' must be binary (have 2 factor levels). Found: ",
+               paste(mediator_levels, collapse=", ")))
+  }
+  m_level0 <- factor(rep(mediator_levels[1], n_obs), levels = mediator_levels)
+  m_level1 <- factor(rep(mediator_levels[2], n_obs), levels = mediator_levels)
+  
+  # Probabilities for M=0 under different exposure scenarios
+  prob_m0_given_a <- 1 - prob_m_given_a
+  prob_m0_given_astar <- 1 - prob_m_given_astar
+  
+  # --- E[Y(astar, M_astar)] ---
+  # P(Y=1 | A=astar, M=0, C)
+  newdata_y_astar_m0 <- data_analysis
+  newdata_y_astar_m0[[exposure_name]] <- factor(rep(astar, n_obs), levels = exposure_levels)
+  newdata_y_astar_m0[[mediator_name]] <- m_level0
+  pred_y_astar_m0 <- predict(reg.y, newdata = newdata_y_astar_m0, type = "response")
+  
+  # P(Y=1 | A=astar, M=1, C)
+  newdata_y_astar_m1 <- data_analysis
+  newdata_y_astar_m1[[exposure_name]] <- factor(rep(astar, n_obs), levels = exposure_levels)
+  newdata_y_astar_m1[[mediator_name]] <- m_level1
+  pred_y_astar_m1 <- predict(reg.y, newdata = newdata_y_astar_m1, type = "response")
+  
+  EY00_pred_all <- pred_y_astar_m0 * prob_m0_given_astar + pred_y_astar_m1 * prob_m_given_astar
+  
+  # --- E[Y(a, M_astar)] ---
+  # P(Y=1 | A=a, M=0, C)
+  newdata_y_a_m0 <- data_analysis
+  newdata_y_a_m0[[exposure_name]] <- factor(rep(a, n_obs), levels = exposure_levels)
+  newdata_y_a_m0[[mediator_name]] <- m_level0
+  pred_y_a_m0 <- predict(reg.y, newdata = newdata_y_a_m0, type = "response")
+  
+  # P(Y=1 | A=a, M=1, C)
+  newdata_y_a_m1 <- data_analysis
+  newdata_y_a_m1[[exposure_name]] <- factor(rep(a, n_obs), levels = exposure_levels)
+  newdata_y_a_m1[[mediator_name]] <- m_level1
+  pred_y_a_m1 <- predict(reg.y, newdata = newdata_y_a_m1, type = "response")
+  
+  EY10_pred_all <- pred_y_a_m0 * prob_m0_given_astar + pred_y_a_m1 * prob_m_given_astar
+  
+  # --- E[Y(a, M_a)] ---
+  # We already have P(Y=1 | A=a, M=0, C) -> pred_y_a_m0
+  # We already have P(Y=1 | A=a, M=1, C) -> pred_y_a_m1
+  EY11_pred_all <- pred_y_a_m0 * prob_m0_given_a + pred_y_a_m1 * prob_m_given_a
+
+  # --- 6. Calculate Average Counterfactual Outcomes ---
+  EY00 <- mean(EY00_pred_all)
+  EY10 <- mean(EY10_pred_all)
+  EY11 <- mean(EY11_pred_all)
+  #print(EY00)
+
+  # --- 7. Calculate Mediation Effects ---
+  # On the Risk Difference (RD) scale
+  #nde_rd <- EY10 - EY00  # Natural Direct Effect
+  #nie_rd <- EY11 - EY10  # Natural Indirect Effect
+  #te_rd  <- EY11 - EY00  # Total Effect (or nde_rd + nie_rd)
+
+  # On the Log Odds Ratio (logOR) scale
+  # Clamp probabilities slightly to avoid log(0) or log(1) if EYxx is exactly 0 or 1
+  # Though with mean over many predictions, this is less likely than for individual predictions
+  epsilon <- 1e-9
+  EY00_clamped <- pmin(pmax(EY00, epsilon), 1 - epsilon)
+  EY10_clamped <- pmin(pmax(EY10, epsilon), 1 - epsilon)
+  EY11_clamped <- pmin(pmax(EY11, epsilon), 1 - epsilon)
+
+  # qlogis is logit
+  logOR_nde <- qlogis(EY10_clamped) - qlogis(EY00_clamped)
+  logOR_nie <- qlogis(EY11_clamped) - qlogis(EY10_clamped)
+  logOR_te  <- qlogis(EY11_clamped) - qlogis(EY00_clamped) # Or logOR_nde + logOR_nie
+
+  # --- 8. Return Results ---
+  results <- c(
+    # Odds Ratios
+    Rpnde = exp(logOR_nde), 
+    Rtnie = exp(logOR_nie), 
+    Rte = exp(logOR_te)     
+  )
+  return(results)
+}
+
+```
+
+```{r}
+# --- Naive Analysis ---
+cols_of_interest <- c(outcome_variable, exposure_variable, mediator_variable, confounder_variables)
+df.subset <- df[, cols_of_interest] 
+ complete_rows <- complete.cases(df.subset) 
+ df.complete <- df[complete_rows, ] 
+
+
+# Point estimates (no bootstrapping)
+mediation_results_revised <- run_mediation_analysis(
+  data = df.complete,
+  outcome_name = outcome_variable,
+  exposure_name = exposure_variable,
+  mediator_name = mediator_variable,
+  confounder_names = confounder_variables,
+  base_interaction_names = base_interaction_vars, 
+  indices = NULL
+)
+
+point_summary <- data.frame(mediation_results_revised)
+write.csv(point_summary, "naive-point-summary.csv", row.names=FALSE) 
+point_summary
+```
+
+```{r}
+# --- Naive Analysis ---
+# Bootstrapped
+boot_results <- boot(
+ data = df.complete,
+ statistic = function(data, indices) {
+   run_mediation_analysis(
+     data = data, 
+     outcome_name = outcome_variable,
+     exposure_name = exposure_variable,
+     mediator_name = mediator_variable,
+     confounder_names = confounder_variables,
+     base_interaction_names = base_interaction_vars,
+     indices = indices # Bootstrapped indices
+   )
+ },
+ R = 200 # Number of bootstrap replicates 
+)
+
+effect_names <- c("Rpnde", "Rtnie", "Rte")
+
+# Create summary data frame
+boot_summary <- data.frame(
+  Estimate = boot_results$t0,
+  Bias = apply(boot_results$t, 2, mean) - boot_results$t0,
+  Std_Error = apply(boot_results$t, 2, sd)
+)
+
+# Add percentile-based CIs
+for (i in 1:length(effect_names)) {
+  ci <- boot::boot.ci(boot_results, index = i, type = "perc")$percent[4:5]
+  boot_summary$CI_Lower[i] <- ci[1]
+  boot_summary$CI_Upper[i] <- ci[2]
+}
+
+write.csv(boot_summary, "naive-result.csv", row.names=FALSE) 
+boot_summary
+```
+
+```{r}
+run_mediation_analysis_ipw <- function(total_data, # Changed from 'data'
+                                       outcome_name,
+                                       exposure_name,
+                                       mediator_name,
+                                       confounder_names, # Main confounders for M and Y models
+                                       selection_model_predictors, # Predictors for the S=1 model
+                                       selection_model_interactions = NULL, # e.g., c("age:race_ethnicity") for S model
+                                       mediation_confounder_interactions = NULL, # e.g., c("age:race_ethnicity") for M & Y models
+                                       indices = NULL) {
+
+  # --- 0. Determine data for this iteration (original or bootstrap sample) ---
+  current_total_data <- if (!is.null(indices)) total_data[indices, ] else total_data
+
+  if (nrow(current_total_data) == 0) {
+    warning("Current total data has 0 rows (e.g., empty bootstrap sample).")
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+
+
+  # --- 1. Create Selection Indicator (S) and prob_s_marginal ---
+  current_total_data$S_indicator_internal <- as.numeric(!is.na(current_total_data[[mediator_name]]))
+  prob_s_marginal <- mean(current_total_data$S_indicator_internal, na.rm = TRUE) # na.rm just in case S is NA (should not happen)
+
+  if (prob_s_marginal == 0 || is.na(prob_s_marginal)) {
+    warning("No observations with observed mediator (or all S are NA) in the current sample.")
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+  
+
+
+  # --- 2. Fit Selection Model ---
+  selection_formula_rhs_parts <- c(selection_model_predictors, selection_model_interactions)
+  if (length(selection_formula_rhs_parts) == 0 || all(nchar(selection_formula_rhs_parts) == 0)) {
+     stop("No predictors specified for the selection model.")
+  }
+  selection_formula <- as.formula(paste("S_indicator_internal ~", paste(selection_formula_rhs_parts, collapse = " + ")))
+
+  logistic_selection_model <- tryCatch({
+    glm(selection_formula, data = current_total_data, family = binomial())
+  }, error = function(e) {
+    warning(paste("Error fitting selection model:", e$message))
+    return(NULL)
+  })
+
+  if (is.null(logistic_selection_model)) {
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+
+  # --- 3. Create data_analysis (subset where S=1 and mediator is not NA) ---
+  # Ensure mediator is not NA also, S_indicator_internal == 1 implies !is.na(mediator)
+  data_analysis <- current_total_data[current_total_data$S_indicator_internal == 1 & !is.na(current_total_data[[mediator_name]]), ]
+  n_obs <- nrow(data_analysis)
+
+  if (n_obs == 0) {
+    warning("No observations in data_analysis (S=1 subset is empty after filtering).")
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+
+  # --- 4. Calculate IP Weights for data_analysis ---
+  pred_prob_selection_for_S1 <- predict(logistic_selection_model, newdata = data_analysis, type = "response")
+  epsilon_ipw <- 1e-7 # Small constant to prevent division by zero or extreme weights
+  pred_prob_selection_for_S1_clamped <- pmax(pred_prob_selection_for_S1, epsilon_ipw)
+  ip_weights_for_analysis <- prob_s_marginal / pred_prob_selection_for_S1_clamped
+
+  # --- 5. Prepare data_analysis for mediation (factors, etc.) ---
+  if (!is.factor(data_analysis[[exposure_name]])) {
+    data_analysis[[exposure_name]] <- factor(data_analysis[[exposure_name]])
+  }
+  if (!is.factor(data_analysis[[mediator_name]])) { # Mediator is !NA here
+    data_analysis[[mediator_name]] <- factor(data_analysis[[mediator_name]])
+  }
+  if (!is.factor(data_analysis[[outcome_name]])) {
+    data_analysis[[outcome_name]] <- factor(data_analysis[[outcome_name]])
+  }
+
+  exposure_levels <- levels(data_analysis[[exposure_name]])
+  if (length(exposure_levels) != 2) {
+    warning(paste("Exposure '", exposure_name, "' in S=1 subset has ", length(exposure_levels), " levels. Expected 2."))
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+  astar <- exposure_levels[1]; a <- exposure_levels[2]
+
+  mediator_levels <- levels(data_analysis[[mediator_name]])
+  if (length(mediator_levels) != 2) {
+    warning(paste("Mediator '", mediator_name, "' in S=1 subset has ", length(mediator_levels), " levels. Expected 2."))
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+  m_level0_val <- mediator_levels[1]; m_level1_val <- mediator_levels[2]
+
+  # --- 6. Define Formulas for M and Y models ---
+  med_formula_rhs_parts <- c(exposure_name, confounder_names, mediation_confounder_interactions)
+  mediator_formula <- as.formula(paste(mediator_name, "~", paste(med_formula_rhs_parts, collapse = " + ")))
+
+  out_formula_rhs_parts <- c(exposure_name, mediator_name, paste0(exposure_name, ":", mediator_name),
+                             confounder_names, mediation_confounder_interactions)
+  outcome_formula <- as.formula(paste(outcome_name, "~", paste(out_formula_rhs_parts, collapse = " + ")))
+
+  # --- 7. Fit Weighted Regression Models on data_analysis ---
+  reg.m <- tryCatch({
+    glm(formula = mediator_formula, family = binomial(), data = data_analysis, weights = ip_weights_for_analysis)
+  }, error = function(e) {warning(paste("Error fitting weighted mediator model:", e$message)); NULL})
+  if(is.null(reg.m)) return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+
+  reg.y <- tryCatch({
+    glm(formula = outcome_formula, family = binomial(), data = data_analysis, weights = ip_weights_for_analysis)
+  }, error = function(e) {warning(paste("Error fitting weighted outcome model:", e$message)); NULL})
+  if(is.null(reg.y)) return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+
+  # --- 8. Counterfactual Predictions for Mediator (on data_analysis) ---
+  newdata_med_a <- data_analysis
+  newdata_med_a[[exposure_name]] <- factor(rep(a, n_obs), levels = exposure_levels)
+  newdata_med_astar <- data_analysis
+  newdata_med_astar[[exposure_name]] <- factor(rep(astar, n_obs), levels = exposure_levels)
+
+  prob_m_given_a <- predict(reg.m, newdata = newdata_med_a, type = "response")
+  prob_m_given_astar <- predict(reg.m, newdata = newdata_med_astar, type = "response")
+
+  # --- 9. Counterfactual Predictions for Outcome (on data_analysis) ---
+  m_level0_factor <- factor(rep(m_level0_val, n_obs), levels = mediator_levels)
+  m_level1_factor <- factor(rep(m_level1_val, n_obs), levels = mediator_levels)
+  prob_m0_given_a <- 1 - prob_m_given_a
+  prob_m0_given_astar <- 1 - prob_m_given_astar
+
+  # Create newdata frames once for each A, M combination for reg.y predictions
+  newdata_base_astar_m0 <- data_analysis; newdata_base_astar_m0[[exposure_name]] <- factor(rep(astar, n_obs), levels=exposure_levels); newdata_base_astar_m0[[mediator_name]] <- m_level0_factor
+  newdata_base_astar_m1 <- data_analysis; newdata_base_astar_m1[[exposure_name]] <- factor(rep(astar, n_obs), levels=exposure_levels); newdata_base_astar_m1[[mediator_name]] <- m_level1_factor
+  newdata_base_a_m0 <- data_analysis; newdata_base_a_m0[[exposure_name]] <- factor(rep(a, n_obs), levels=exposure_levels); newdata_base_a_m0[[mediator_name]] <- m_level0_factor
+  newdata_base_a_m1 <- data_analysis; newdata_base_a_m1[[exposure_name]] <- factor(rep(a, n_obs), levels=exposure_levels); newdata_base_a_m1[[mediator_name]] <- m_level1_factor
+
+  pred_y_astar_m0 <- predict(reg.y, newdata = newdata_base_astar_m0, type = "response")
+  pred_y_astar_m1 <- predict(reg.y, newdata = newdata_base_astar_m1, type = "response")
+  pred_y_a_m0     <- predict(reg.y, newdata = newdata_base_a_m0, type = "response")
+  pred_y_a_m1     <- predict(reg.y, newdata = newdata_base_a_m1, type = "response")
+
+  EY00_pred_all <- pred_y_astar_m0 * prob_m0_given_astar + pred_y_astar_m1 * prob_m_given_astar
+  EY10_pred_all <- pred_y_a_m0     * prob_m0_given_astar + pred_y_a_m1     * prob_m_given_astar
+  EY11_pred_all <- pred_y_a_m0     * prob_m0_given_a     + pred_y_a_m1     * prob_m_given_a
+
+  # --- 10. Calculate Average Counterfactual Outcomes & Effects ---
+  # The G-formula part uses a simple mean of the predicted counterfactual outcomes from the
+  # (already IPW-reweighted) analysis sample.
+  EY00 <- mean(EY00_pred_all, na.rm = TRUE)
+  EY10 <- mean(EY10_pred_all, na.rm = TRUE)
+  EY11 <- mean(EY11_pred_all, na.rm = TRUE)
+
+  epsilon_eff <- 1e-9
+  EY00_clamped <- pmin(pmax(EY00, epsilon_eff), 1 - epsilon_eff)
+  EY10_clamped <- pmin(pmax(EY10, epsilon_eff), 1 - epsilon_eff)
+  EY11_clamped <- pmin(pmax(EY11, epsilon_eff), 1 - epsilon_eff)
+
+  if(anyNA(c(EY00_clamped, EY10_clamped, EY11_clamped))) {
+    warning("NA values in clamped average counterfactual outcomes. Check model predictions and weights.")
+    return(c(Rpnde = NA_real_, Rtnie = NA_real_, Rte = NA_real_))
+  }
+  
+  logOR_nde <- qlogis(EY10_clamped) - qlogis(EY00_clamped)
+  logOR_nie <- qlogis(EY11_clamped) - qlogis(EY10_clamped)
+  logOR_te  <- qlogis(EY11_clamped) - qlogis(EY00_clamped)
+
+  results <- c(
+    Rpnde = exp(logOR_nde),
+    Rtnie = exp(logOR_nie),
+    Rte = exp(logOR_te)
+  )
+  return(results)
+}
+```
+
+```{r}
+# --- Naive Analysis ---
+# Point estimates (no bootstrapping)
+results_ipw <- run_mediation_analysis_ipw(
+   total_data = total.df,
+   outcome_name = outcome_variable,
+   exposure_name = exposure_variable,
+   mediator_name = mediator_variable,
+   confounder_names = confounder_variables,
+   selection_model_predictors = confounder_variables,
+   selection_model_interactions = base_interaction_vars,
+   mediation_confounder_interactions = base_interaction_vars, 
+   indices = NULL
+ )
+
+point_summary <- data.frame(results_ipw)
+write.csv(point_summary, "selection-point-summary.csv", row.names=FALSE) 
+point_summary
+```
+
+```{r}
+# --- Bootstrap Function Definition ---
+# This function will be called by boot() for each replicate
+bootstrap_ipw_mediation_statistic <- function(data, indices_boot) {
+  # 'indices_boot' are the row indices for the current bootstrap sample
+  run_mediation_analysis_ipw(
+    total_data = data, # Pass the original full dataset
+    outcome_name = outcome_variable,
+    exposure_name = exposure_variable,
+    mediator_name = mediator_variable,
+    confounder_names = confounder_variables,
+    selection_model_predictors = confounder_variables,
+    selection_model_interactions = base_interaction_vars,
+    mediation_confounder_interactions = base_interaction_vars,
+    indices = indices_boot # Critical: pass the bootstrap indices here
+  )
+}
+
+# --- Run Bootstrap ---
+boot_results_ipw <- boot(
+  data = total.df, 
+  statistic = bootstrap_ipw_mediation_statistic,
+  R = 200 # Number of bootstrap replicates
+)
+
+# --- Summarize Bootstrap Results ---
+effect_names_ipw <- c("Rpnde", "Rtnie", "Rte")
+
+# Point estimates (from the original sample analysis, t0)
+point_estimates_ipw <- boot_results_ipw$t0
+names(point_estimates_ipw) <- effect_names_ipw # Ensure names are set if not already
+
+# Calculate bias: mean of bootstrap estimates - original estimate
+# boot_results_ipw$t is a matrix where rows are replicates, columns are effects
+mean_bootstrap_estimates_ipw <- apply(boot_results_ipw$t, 2, mean, na.rm = TRUE)
+bias_ipw <- mean_bootstrap_estimates_ipw - point_estimates_ipw
+
+# Calculate standard error: standard deviation of bootstrap estimates
+std_error_ipw <- apply(boot_results_ipw$t, 2, sd, na.rm = TRUE)
+
+# Create summary data frame
+boot_summary_ipw <- data.frame(
+  Effect = effect_names_ipw,
+  Estimate = point_estimates_ipw,
+  Bias = bias_ipw,
+  Std_Error = std_error_ipw,
+  CI_Lower_Percentile = NA_real_, # Placeholder
+  CI_Upper_Percentile = NA_real_  # Placeholder
+)
+rownames(boot_summary_ipw) <- NULL # Clean row names
+
+# Add percentile-based CIs
+# Ensure that the number of effects matches the columns in boot_results_ipw$t
+if (ncol(boot_results_ipw$t) == length(effect_names_ipw)) {
+  for (i in 1:length(effect_names_ipw)) {
+    ci <- tryCatch({
+      boot::boot.ci(boot_results_ipw, index = i, type = "perc")
+    }, error = function(e) {
+      warning(paste("Could not compute percentile CI for effect index", i, ":", e$message))
+      return(NULL)
+    })
+    
+    if (!is.null(ci) && !is.null(ci$percent)) {
+      # boot.ci$percent is typically a matrix where the last two elements of the last row are lower and upper bounds
+      # For type="perc", it's often the 4th and 5th elements of the $percent vector
+      ci_values <- ci$percent[ (length(ci$percent)-1) : length(ci$percent) ]
+      boot_summary_ipw$CI_Lower_Percentile[i] <- ci_values[1]
+      boot_summary_ipw$CI_Upper_Percentile[i] <- ci_values[2]
+    } else {
+       boot_summary_ipw$CI_Lower_Percentile[i] <- NA
+       boot_summary_ipw$CI_Upper_Percentile[i] <- NA
+    }
+  }
+} else {
+  warning("Mismatch between number of effects and columns in bootstrap results. CIs not computed.")
+}
+
+
+# --- Output Results ---
+print("--- IPW Mediation Bootstrap Summary ---")
+print(boot_summary_ipw)
+write.csv(boot_summary_ipw, "selection-boots-summary.csv", row.names=FALSE) 
+```
+
